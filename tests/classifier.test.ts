@@ -252,6 +252,8 @@ function fakeComplete(responses: AssistantMessage[]) {
 		sessionId?: string;
 		cacheRetention?: string;
 		headers?: Record<string, string>;
+		externalToolExecutor?: boolean;
+		cursorExternalToolExecutor?: boolean;
 		messages: unknown;
 		tools?: unknown;
 		systemPrompt: string;
@@ -268,6 +270,8 @@ function fakeComplete(responses: AssistantMessage[]) {
 			sessionId?: string;
 			cacheRetention?: string;
 			headers?: Record<string, string>;
+			externalToolExecutor?: boolean;
+			cursorExternalToolExecutor?: boolean;
 		},
 	): Promise<AssistantMessage> => {
 		calls.push({
@@ -280,6 +284,12 @@ function fakeComplete(responses: AssistantMessage[]) {
 				: {}),
 			...(Object.hasOwn(callOptions, "timeoutMs")
 				? { timeoutMs: callOptions.timeoutMs }
+				: {}),
+			...(Object.hasOwn(callOptions, "externalToolExecutor")
+				? { externalToolExecutor: callOptions.externalToolExecutor }
+				: {}),
+			...(Object.hasOwn(callOptions, "cursorExternalToolExecutor")
+				? { cursorExternalToolExecutor: callOptions.cursorExternalToolExecutor }
 				: {}),
 			sessionId: callOptions.sessionId,
 			cacheRetention: callOptions.cacheRetention,
@@ -1527,3 +1537,260 @@ test("classifyWithRetry reports a thrown attempt via onAttempt and fails closed"
 	assert.match(attempts[0]?.error ?? "", /network down/);
 	assert.equal(attempts[0]?.response, undefined);
 });
+
+test("cursor-agent detailed stage omits sessionId, enables external tool handoff, and accepts stopReason stop with narration", async () => {
+	const cursorDecisionMessage: AssistantMessage = {
+		...assistantWithDecision(
+			{
+				decision: "allow",
+				tier: "explicit_intent",
+				reason: "Authorized within task scope.",
+			},
+			{
+				stopReason: "stop",
+				text: "Classifier decision submitted.",
+				thinking: true,
+			},
+		),
+		api: "cursor-agent",
+		provider: "cursor",
+		model: "glm-5.2",
+	};
+
+	// Direct parser callers default to rejecting narration unless explicitly opted in.
+	assert.equal(parseClassifierDecision(cursorDecisionMessage), undefined);
+	assert.deepEqual(
+		parseClassifierDecision(cursorDecisionMessage, { allowNarrationText: true }),
+		{
+			decision: "allow",
+			tier: "explicit_intent",
+			reason: "Authorized within task scope.",
+		},
+	);
+
+	// Non-cursor-agent messages must still reject non-empty text even when allowNarrationText is true.
+	assert.equal(
+		parseClassifierDecision(
+			{
+				...cursorDecisionMessage,
+				api: "test",
+			},
+			{ allowNarrationText: true },
+		),
+		undefined,
+	);
+
+	// cursor-agent must still reject multiple tool calls or missing required fields.
+	const cursorMultipleCalls: AssistantMessage = {
+		...cursorDecisionMessage,
+		content: [
+			...cursorDecisionMessage.content,
+			{
+				type: "toolCall",
+				id: "extra-tool-call",
+				name: "edit",
+				arguments: { path: "src/math.js" },
+			},
+		],
+	};
+	assert.equal(parseClassifierDecision(cursorMultipleCalls), undefined);
+
+	const cursorMissingReason: AssistantMessage = {
+		...assistantWithDecision(
+			{ decision: "allow", tier: "allow" },
+			{ stopReason: "stop", text: "Done." },
+		),
+		api: "cursor-agent",
+	};
+	assert.equal(parseClassifierDecision(cursorMissingReason), undefined);
+
+	const { fn, calls } = fakeComplete([
+		{
+			...assistantWith("1", "stop"),
+			api: "cursor-agent",
+			provider: "cursor",
+			model: "glm-5.2",
+		},
+		cursorDecisionMessage,
+	]);
+	const cursorClassifier = {
+		...classifierWithContext(),
+		model: {
+			provider: "cursor",
+			id: "glm-5.2",
+			api: "cursor-agent",
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		} as any,
+	};
+	const attempts: ClassifierIoAttempt[] = [];
+	const decision = await classifyInStages(
+		fn,
+		cursorClassifier,
+		stagedPrompt(),
+		undefined,
+		{
+			sessionId: "pi-automode:test-session",
+			onAttempt: (attempt) => attempts.push(attempt),
+		},
+	);
+
+	assert.deepEqual(decision, {
+		decision: "allow",
+		tier: "explicit_intent",
+		reason: "Authorized within task scope.",
+	});
+	assert.equal(calls.length, 2);
+	assert.equal(calls[0]?.sessionId, undefined);
+	assert.equal(calls[0]?.externalToolExecutor, undefined);
+	assert.equal(calls[0]?.cursorExternalToolExecutor, undefined);
+	assert.equal(calls[1]?.sessionId, undefined);
+	assert.equal(calls[1]?.externalToolExecutor, true);
+	assert.equal(calls[1]?.cursorExternalToolExecutor, true);
+	assert.deepEqual(attempts.map((a) => a.stage), ["fast", "detailed"]);
+	assert.equal(attempts[1]?.parsed?.decision, "allow");
+});
+
+test("cursor-agent detailed stage still fails closed on truncated, error, or aborted stopReason", async () => {
+	const cursorClassifier = {
+		...classifierWithContext(),
+		model: {
+			provider: "cursor",
+			id: "glm-5.2",
+			api: "cursor-agent",
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		} as any,
+	};
+
+	const { fn, calls } = fakeComplete([
+		{
+			...assistantWithDecision(VALID_ALLOW, { stopReason: "length", text: "Truncated." }),
+			api: "cursor-agent",
+		},
+		{
+			...assistantWithDecision(VALID_ALLOW, { stopReason: "stop", text: "Completed." }),
+			api: "cursor-agent",
+		},
+	]);
+	const decision = await classifyWithRetry(
+		fn,
+		cursorClassifier,
+		{ systemPrompt: "s", messages: [], tools: [CLASSIFIER_DECISION_TOOL] },
+		undefined,
+	);
+	assert.equal(decision.decision, "allow");
+	assert.equal(calls.length, 2);
+
+	for (const terminalStopReason of ["error", "aborted"] as const) {
+		const terminalRun = fakeComplete([
+			{
+				...assistantWithDecision(VALID_ALLOW, {
+					stopReason: terminalStopReason,
+					text: "Failed turn.",
+				}),
+				api: "cursor-agent",
+				errorMessage: `cursor ${terminalStopReason}`,
+			},
+		]);
+		const terminalDecision = await classifyWithRetry(
+			terminalRun.fn,
+			cursorClassifier,
+			{ systemPrompt: "s", messages: [], tools: [CLASSIFIER_DECISION_TOOL] },
+			undefined,
+		);
+		assert.equal(terminalDecision.decision, "block");
+		assert.equal(terminalDecision.tier, "none");
+		assert.equal(terminalRun.calls.length, 1);
+	}
+});
+
+test("cursor-agent stopReason exception rejects API mismatches in both directions", async () => {
+	const cursorClassifier = {
+		...classifierWithContext(),
+		model: {
+			provider: "cursor",
+			id: "glm-5.2",
+			api: "cursor-agent",
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		} as any,
+	};
+	const nonCursorClassifier = {
+		...classifierWithContext(),
+		model: {
+			provider: "openai",
+			id: "gpt-5",
+			api: "openai-responses",
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		} as any,
+	};
+
+	const nonCursorResponseOnCursorModel = fakeComplete([
+		{
+			...assistantWithDecision(VALID_ALLOW, { stopReason: "stop" }),
+			api: "openai-responses" as any,
+		},
+		{
+			...assistantWithDecision(VALID_ALLOW, { stopReason: "stop" }),
+			api: "openai-responses" as any,
+		},
+	]);
+	const mismatchDecisionA = await classifyWithRetry(
+		nonCursorResponseOnCursorModel.fn,
+		cursorClassifier,
+		{ systemPrompt: "s", messages: [], tools: [CLASSIFIER_DECISION_TOOL] },
+		undefined,
+	);
+	assert.equal(mismatchDecisionA.decision, "block");
+	assert.equal(mismatchDecisionA.tier, "none");
+	assert.equal(nonCursorResponseOnCursorModel.calls.length, 2);
+
+	const cursorResponseOnNonCursorModel = fakeComplete([
+		{
+			...assistantWithDecision(VALID_ALLOW, { stopReason: "stop" }),
+			api: "cursor-agent",
+		},
+		{
+			...assistantWithDecision(VALID_ALLOW, { stopReason: "stop" }),
+			api: "cursor-agent",
+		},
+	]);
+	const mismatchDecisionB = await classifyWithRetry(
+		cursorResponseOnNonCursorModel.fn,
+		nonCursorClassifier,
+		{ systemPrompt: "s", messages: [], tools: [CLASSIFIER_DECISION_TOOL] },
+		undefined,
+	);
+	assert.equal(mismatchDecisionB.decision, "block");
+	assert.equal(mismatchDecisionB.tier, "none");
+	assert.equal(cursorResponseOnNonCursorModel.calls.length, 2);
+
+	const cursorNarrationToolUseOnNonCursorModel = fakeComplete([
+		{
+			...assistantWithDecision(VALID_ALLOW, {
+				stopReason: "toolUse",
+				text: "Spoofed cursor narration.",
+			}),
+			api: "cursor-agent",
+		},
+		{
+			...assistantWithDecision(VALID_ALLOW, {
+				stopReason: "toolUse",
+				text: "Spoofed cursor narration.",
+			}),
+			api: "cursor-agent",
+		},
+	]);
+	const mismatchDecisionC = await classifyWithRetry(
+		cursorNarrationToolUseOnNonCursorModel.fn,
+		nonCursorClassifier,
+		{ systemPrompt: "s", messages: [], tools: [CLASSIFIER_DECISION_TOOL] },
+		undefined,
+	);
+	assert.equal(mismatchDecisionC.decision, "block");
+	assert.equal(mismatchDecisionC.tier, "none");
+	assert.equal(cursorNarrationToolUseOnNonCursorModel.calls.length, 2);
+});
+
